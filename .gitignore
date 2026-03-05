@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual env
+.venv/
+venv/
+
+# Environment and secrets
+.env
+
+# Runtime data
+logs/
+data/
+artifacts/
+data.conf
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
