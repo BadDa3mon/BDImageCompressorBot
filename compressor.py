@@ -4,6 +4,7 @@ from typing import Optional, Tuple
 from PIL import Image, ImageOps
 
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png"}
+PNG_PALETTE_COLORS = (16, 24, 32, 48, 64, 96, 128, 192, 256)
 
 
 @dataclass
@@ -95,10 +96,14 @@ def compress_image_file(
     dst_path: str,
     cfg: CompressConfig,
     output_format: Optional[str] = None,
+    quality_level: Optional[int] = None,
 ) -> Tuple[int, int]:
     """
     Returns (src_bytes, dst_bytes)
     """
+    if quality_level is not None and not 1 <= quality_level <= 10:
+        raise ValueError("quality_level must be between 1 and 10")
+
     dst_path = output_path_for_source(src_path, dst_path, cfg, output_format)
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
 
@@ -126,14 +131,29 @@ def compress_image_file(
             img.save(
                 dst_path,
                 format="JPEG",
-                quality=max(1, min(cfg.jpeg_quality, 95)),
+                quality=(
+                    min(quality_level * 10, 95)
+                    if quality_level
+                    else max(1, min(cfg.jpeg_quality, 95))
+                ),
                 optimize=cfg.jpeg_optimize,
                 progressive=cfg.jpeg_progressive,
             )
 
         elif target_format == "png":
             has_alpha = "A" in img.getbands() or "transparency" in img.info
-            if cfg.png_quantize and not has_alpha:
+            if quality_level is not None:
+                if quality_level < 10:
+                    colors = PNG_PALETTE_COLORS[quality_level - 1]
+                    if has_alpha:
+                        img = img.convert("RGBA").quantize(
+                            colors=colors, method=Image.Quantize.FASTOCTREE
+                        )
+                    else:
+                        img = img.convert("RGB").quantize(
+                            colors=colors, method=Image.Quantize.MEDIANCUT
+                        )
+            elif cfg.png_quantize and not has_alpha:
                 img = img.convert("RGB").quantize(colors=256, method=Image.Quantize.FASTOCTREE)
 
             img.save(

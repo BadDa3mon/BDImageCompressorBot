@@ -74,7 +74,8 @@ HELP_TEXT = (
     "Я пережимаю PNG/JPG и ZIP-архивы с картинками.\n\n"
     "Формат результата:\n"
     "• /jpeg — JPEG (по умолчанию)\n"
-    "• /png — PNG с сохранением прозрачности\n\n"
+    "• /png — PNG с сохранением прозрачности\n"
+    "• /quality 1..10 — качество для обоих форматов\n\n"
     "• Пришли картинку (лучше как файл, не photo — Telegram иногда сжимает заранее)\n"
     "• Или пришли ZIP — я сохраню структуру папок и верну *_compressed.zip*\n\n"
     "Поддерживаемые: .jpg .jpeg .png\n"
@@ -169,6 +170,39 @@ async def get_user_output_format(msg: Message) -> str:
             cfg.read(DATA_CONF_PATH, encoding="utf-8")
         output_format = cfg.get(section, "output_format", fallback="jpeg")
     return output_format if output_format in {"png", "jpeg"} else "jpeg"
+
+
+async def set_user_quality(msg: Message, quality_level: int) -> None:
+    if not msg.from_user:
+        return
+
+    section = f"user:{msg.from_user.id}"
+    async with DATA_LOCK:
+        cfg = configparser.ConfigParser()
+        if DATA_CONF_PATH.exists():
+            cfg.read(DATA_CONF_PATH, encoding="utf-8")
+        if not cfg.has_section(section):
+            cfg.add_section(section)
+        cfg.set(section, "quality_level", str(quality_level))
+        DATA_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(DATA_CONF_PATH, "w", encoding="utf-8") as f:
+            cfg.write(f)
+
+
+async def get_user_quality(msg: Message) -> int:
+    if not msg.from_user:
+        return 10
+
+    section = f"user:{msg.from_user.id}"
+    async with DATA_LOCK:
+        cfg = configparser.ConfigParser()
+        if DATA_CONF_PATH.exists():
+            cfg.read(DATA_CONF_PATH, encoding="utf-8")
+        try:
+            quality_level = cfg.getint(section, "quality_level", fallback=10)
+        except ValueError:
+            quality_level = 10
+    return quality_level if 1 <= quality_level <= 10 else 10
 
 
 def _safe_filename(name: str) -> str:
@@ -314,6 +348,7 @@ async def _process_single_image(
     file_id: str,
     filename: str,
     output_format: str,
+    quality_level: int,
 ) -> Tuple[int, int]:
     cfg = load_config_from_env()
     with tempfile.TemporaryDirectory(prefix="tgcmp_") as td:
@@ -332,7 +367,7 @@ async def _process_single_image(
         t0 = time.monotonic()
         log.info("[%s] compress started (single): %s", job_id, src_path.name)
         src_b, dst_b = await asyncio.to_thread(
-            compress_image_file, str(src_path), str(dst_path), cfg, output_format
+            compress_image_file, str(src_path), str(dst_path), cfg, output_format, quality_level
         )
         log.info("[%s] compress done in %.2fs", job_id, time.monotonic() - t0)
         _store_file(job_id, "output", dst_path)
@@ -349,6 +384,7 @@ async def _process_zip(
     file_id: str,
     filename: str,
     output_format: str,
+    quality_level: int,
     status_msg: Optional[Message] = None,
 ) -> Tuple[int, int]:
     cfg = load_config_from_env()
@@ -404,7 +440,7 @@ async def _process_zip(
             try:
                 t_img = time.monotonic()
                 s, d = await asyncio.to_thread(
-                    compress_image_file, str(src_img), str(dst_img), cfg, output_format
+                    compress_image_file, str(src_img), str(dst_img), cfg, output_format, quality_level
                 )
                 one_elapsed = time.monotonic() - t_img
                 if dst_img != dst_img_orig and dst_img_orig.exists():
@@ -438,7 +474,7 @@ async def _process_zip(
             f"{_job_prefix(job_id)} выполнена ✅\n"
             f"{processed} фото сжато (из {total_images})\n"
             f"Суммарно: {total_src/1024:.1f} KB → {total_dst/1024:.1f} KB\n"
-            f"Вывод в .{output_format} (/png, /jpeg)"
+            f"Вывод в .{output_format}, качество {quality_level}/10 (/png, /jpeg, /quality)"
         )
         await msg.answer_document(document=FSInputFile(str(out_zip), filename=out_zip.name), caption=caption)
         return (processed, total_images)
@@ -470,10 +506,38 @@ async def jpeg_handler(message: Message) -> None:
     await message.answer("Формат результата переключён на JPEG ✅")
 
 
+@router.message(Command("quality"))
+async def quality_handler(message: Message) -> None:
+    await upsert_user_to_data_conf(message)
+    current_quality = await get_user_quality(message)
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 1:
+        await message.answer(
+            f"Текущее качество: {current_quality}/10.\n"
+            "Чтобы изменить: /quality 1 … /quality 10\n"
+            "1 — сильные потери, 10 — максимальное качество.\n"
+            "PNG на 10 — без потерь; JPEG даже на 10 остаётся с потерями."
+        )
+        return
+
+    try:
+        quality_level = int(parts[1].strip())
+    except ValueError:
+        quality_level = 0
+
+    if not 1 <= quality_level <= 10:
+        await message.answer("Укажи качество числом от 1 до 10, например: /quality 7")
+        return
+
+    await set_user_quality(message, quality_level)
+    await message.answer(f"Качество переключено на {quality_level}/10 ✅")
+
+
 @router.message(F.photo | F.document)
 async def media_handler(message: Message, bot: Bot) -> None:
     await upsert_user_to_data_conf(message)
     output_format = await get_user_output_format(message)
+    quality_level = await get_user_quality(message)
 
     job_id = str(uuid.uuid4())
     user = message.from_user
@@ -500,6 +564,7 @@ async def media_handler(message: Message, bot: Bot) -> None:
             f"user_id={user.id if user else ''}\n"
             f"username={user.username if user else ''}\n"
             f"output_format={output_format}\n"
+            f"quality_level={quality_level}\n"
         ),
     )
 
@@ -530,7 +595,7 @@ async def media_handler(message: Message, bot: Bot) -> None:
 
             filename = f"photo_{photo.file_unique_id}.jpg"
             processed, total = await _process_single_image(
-                job_id, bot, message, photo.file_id, filename, output_format
+                job_id, bot, message, photo.file_id, filename, output_format, quality_level
             )
             await _send_or_edit_status(message, status_msg, f"{_job_prefix(job_id)} выполнена ✅\n{processed} фото сжато")
             log.info("[%s] Done: processed=%s total=%s (photo)", job_id, processed, total)
@@ -567,7 +632,7 @@ async def media_handler(message: Message, bot: Bot) -> None:
 
             if ext == ".zip":
                 processed, total = await _process_zip(
-                    job_id, bot, message, doc.file_id, filename, output_format, status_msg
+                    job_id, bot, message, doc.file_id, filename, output_format, quality_level, status_msg
                 )
                 await _send_or_edit_status(message, status_msg, f"{_job_prefix(job_id)} выполнена ✅\n{processed} фото сжато")
                 log.info("[%s] Done: processed=%s total=%s (zip)", job_id, processed, total)
@@ -579,7 +644,7 @@ async def media_handler(message: Message, bot: Bot) -> None:
                     filename = f"{Path(filename).stem}{ext}"
 
                 processed, total = await _process_single_image(
-                    job_id, bot, message, doc.file_id, filename, output_format
+                    job_id, bot, message, doc.file_id, filename, output_format, quality_level
                 )
                 await _send_or_edit_status(message, status_msg, f"{_job_prefix(job_id)} выполнена ✅\n{processed} фото сжато")
                 log.info("[%s] Done: processed=%s total=%s (doc image)", job_id, processed, total)
