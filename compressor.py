@@ -1,7 +1,6 @@
 import os
-import shutil
 from dataclasses import dataclass
-from typing import Tuple
+from typing import Optional, Tuple
 from PIL import Image, ImageOps
 
 SUPPORTED_EXT = {".jpg", ".jpeg", ".png"}
@@ -74,7 +73,16 @@ def _maybe_resize(img: Image.Image, max_size: int) -> Image.Image:
     return img.resize((new_w, new_h), Image.LANCZOS)
 
 
-def output_path_for_source(src_path: str, dst_path: str, cfg: CompressConfig) -> str:
+def output_path_for_source(
+    src_path: str,
+    dst_path: str,
+    cfg: CompressConfig,
+    output_format: Optional[str] = None,
+) -> str:
+    if output_format:
+        base, _ = os.path.splitext(dst_path)
+        return f"{base}.png" if output_format == "png" else f"{base}.jpg"
+
     ext = os.path.splitext(src_path)[1].lower()
     if ext == ".png" and cfg.png_to_jpeg:
         base, _ = os.path.splitext(dst_path)
@@ -82,22 +90,37 @@ def output_path_for_source(src_path: str, dst_path: str, cfg: CompressConfig) ->
     return dst_path
 
 
-def compress_image_file(src_path: str, dst_path: str, cfg: CompressConfig) -> Tuple[int, int]:
+def compress_image_file(
+    src_path: str,
+    dst_path: str,
+    cfg: CompressConfig,
+    output_format: Optional[str] = None,
+) -> Tuple[int, int]:
     """
     Returns (src_bytes, dst_bytes)
     """
-    dst_path = output_path_for_source(src_path, dst_path, cfg)
+    dst_path = output_path_for_source(src_path, dst_path, cfg, output_format)
     os.makedirs(os.path.dirname(dst_path), exist_ok=True)
 
     src_bytes = os.path.getsize(src_path)
 
-    ext = os.path.splitext(src_path)[1].lower()
     with Image.open(src_path) as img:
         img = ImageOps.exif_transpose(img)
         img = _maybe_resize(img, cfg.max_size)
 
-        if ext in {".jpg", ".jpeg"}:
-            if img.mode not in ("RGB", "L"):
+        target_format = output_format
+        if target_format is None:
+            ext = os.path.splitext(src_path)[1].lower()
+            target_format = "jpeg" if ext in {".jpg", ".jpeg"} or cfg.png_to_jpeg else "png"
+
+        if target_format == "jpeg":
+            if "A" in img.getbands() or "transparency" in img.info:
+                bg = (255, 255, 255) if cfg.png_jpeg_bg != "black" else (0, 0, 0)
+                alpha_img = img.convert("RGBA")
+                canvas = Image.new("RGB", alpha_img.size, bg)
+                canvas.paste(alpha_img, mask=alpha_img.getchannel("A"))
+                img = canvas
+            elif img.mode not in ("RGB", "L"):
                 img = img.convert("RGB")
 
             img.save(
@@ -108,38 +131,19 @@ def compress_image_file(src_path: str, dst_path: str, cfg: CompressConfig) -> Tu
                 progressive=cfg.jpeg_progressive,
             )
 
-        elif ext == ".png":
-            if cfg.png_to_jpeg:
-                if "A" in img.getbands():
-                    bg = (255, 255, 255) if cfg.png_jpeg_bg != "black" else (0, 0, 0)
-                    alpha_img = img.convert("RGBA")
-                    canvas = Image.new("RGB", alpha_img.size, bg)
-                    canvas.paste(alpha_img, mask=alpha_img.split()[-1])
-                    img = canvas
-                elif img.mode not in ("RGB", "L"):
-                    img = img.convert("RGB")
+        elif target_format == "png":
+            has_alpha = "A" in img.getbands() or "transparency" in img.info
+            if cfg.png_quantize and not has_alpha:
+                img = img.convert("RGB").quantize(colors=256, method=Image.Quantize.FASTOCTREE)
 
-                img.save(
-                    dst_path,
-                    format="JPEG",
-                    quality=max(1, min(cfg.jpeg_quality, 95)),
-                    optimize=cfg.jpeg_optimize,
-                    progressive=cfg.jpeg_progressive,
-                )
-            else:
-                if cfg.png_quantize:
-                    has_alpha = ("A" in img.getbands())
-                    if not has_alpha:
-                        img = img.convert("RGB").quantize(colors=256, method=Image.Quantize.FASTOCTREE)
-
-                img.save(
-                    dst_path,
-                    format="PNG",
-                    optimize=cfg.png_optimize,
-                    compress_level=max(0, min(cfg.png_compress_level, 9)),
-                )
+            img.save(
+                dst_path,
+                format="PNG",
+                optimize=cfg.png_optimize,
+                compress_level=max(0, min(cfg.png_compress_level, 9)),
+            )
         else:
-            shutil.copy2(src_path, dst_path)
+            raise ValueError(f"Unsupported output format: {target_format}")
 
     dst_bytes = os.path.getsize(dst_path)
     return src_bytes, dst_bytes
